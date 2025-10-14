@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Point Cloud Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        #container {
+            width: 100vw;
+            height: 100vh;
+        }
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            z-index: 100;
+        }
+        #fileInput {
+            margin-bottom: 10px;
+        }
+        button {
+            background: #0078d4;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 5px;
+        }
+        button:hover {
+            background: #106ebe;
+        }
+        #info {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            z-index: 100;
+        }
+        .label {
+            font-weight: bold;
+            margin-top: 10px;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <h3 style="margin-top: 0;">Point Cloud Viewer</h3>
+        <input type="file" id="fileInput" accept=".ply,.xyz,.txt,.pcd" />
+        <div>
+            <span class="label">Point Size:</span>
+            <input type="range" id="pointSize" min="0.5" max="5" step="0.5" value="2" />
+            <span id="pointSizeValue">2</span>
+        </div>
+    </div>
+    <div id="info">
+        Click on a point to select it<br>
+        Left mouse: Rotate | Right mouse: Pan | Scroll: Zoom
+    </div>
+    <div id="container"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        let scene, camera, renderer, controls, pointCloud;
+        let selectedPoint = null;
+        let selectionMarker = null;
+        let raycaster, mouse;
+
+        function init() {
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a1a);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(5, 5, 5);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.getElementById('container').appendChild(renderer.domElement);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.4);
+            directionalLight.position.set(10, 10, 10);
+            scene.add(directionalLight);
+
+            // Grid
+            const gridHelper = new THREE.GridHelper(20, 20);
+            scene.add(gridHelper);
+
+            // Raycaster for point selection
+            raycaster = new THREE.Raycaster();
+            raycaster.params.Points.threshold = 0.1;
+            mouse = new THREE.Vector2();
+
+            // Basic orbit controls (simplified)
+            setupControls();
+
+            // Event listeners
+            document.getElementById('fileInput').addEventListener('change', handleFileUpload);
+            document.getElementById('pointSize').addEventListener('input', (e) => {
+                document.getElementById('pointSizeValue').textContent = e.target.value;
+                if (pointCloud) {
+                    pointCloud.material.size = parseFloat(e.target.value);
+                }
+            });
+            renderer.domElement.addEventListener('click', onMouseClick);
+            window.addEventListener('resize', onWindowResize);
+
+            animate();
+        }
+
+        function setupControls() {
+            let isDragging = false;
+            let previousMousePosition = { x: 0, y: 0 };
+            let isRightButton = false;
+
+            renderer.domElement.addEventListener('mousedown', (e) => {
+                isDragging = true;
+                isRightButton = e.button === 2;
+                previousMousePosition = { x: e.clientX, y: e.clientY };
+            });
+
+            renderer.domElement.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+
+                const deltaX = e.clientX - previousMousePosition.x;
+                const deltaY = e.clientY - previousMousePosition.y;
+
+                if (isRightButton) {
+                    // Pan
+                    const panSpeed = 0.01;
+                    camera.position.x -= deltaX * panSpeed;
+                    camera.position.y += deltaY * panSpeed;
+                } else {
+                    // Rotate
+                    const rotateSpeed = 0.005;
+                    const spherical = new THREE.Spherical();
+                    spherical.setFromVector3(camera.position);
+                    spherical.theta -= deltaX * rotateSpeed;
+                    spherical.phi -= deltaY * rotateSpeed;
+                    spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
+                    camera.position.setFromSpherical(spherical);
+                    camera.lookAt(0, 0, 0);
+                }
+
+                previousMousePosition = { x: e.clientX, y: e.clientY };
+            });
+
+            renderer.domElement.addEventListener('mouseup', () => {
+                isDragging = false;
+            });
+
+            renderer.domElement.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                const zoomSpeed = 0.1;
+                const delta = e.deltaY > 0 ? 1 : -1;
+                camera.position.multiplyScalar(1 + delta * zoomSpeed);
+            });
+
+            renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+        }
+
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const content = e.target.result;
+                const extension = file.name.split('.').pop().toLowerCase();
+
+                if (extension === 'ply') {
+                    parsePLY(content);
+                } else if (extension === 'xyz' || extension === 'txt') {
+                    parseXYZ(content);
+                }
+            };
+
+            if (file.name.endsWith('.ply')) {
+                reader.readAsArrayBuffer(file);
+            } else {
+                reader.readAsText(file);
+            }
+        }
+
+        function parsePLY(buffer) {
+            const data = new Uint8Array(buffer);
+            const text = new TextDecoder().decode(data);
+            const headerEnd = text.indexOf('end_header') + 10;
+            const header = text.substring(0, headerEnd);
+            
+            const vertexMatch = header.match(/element vertex (\d+)/);
+            if (!vertexMatch) return;
+            
+            const vertexCount = parseInt(vertexMatch[1]);
+            const hasColor = header.includes('property uchar red');
+            
+            // Binary parsing
+            const dataView = new DataView(buffer, headerEnd + 1);
+            const positions = new Float32Array(vertexCount * 3);
+            const colors = hasColor ? new Float32Array(vertexCount * 3) : null;
+            
+            let offset = 0;
+            for (let i = 0; i < vertexCount; i++) {
+                positions[i * 3] = dataView.getFloat32(offset, true);
+                positions[i * 3 + 1] = dataView.getFloat32(offset + 4, true);
+                positions[i * 3 + 2] = dataView.getFloat32(offset + 8, true);
+                
+                if (hasColor) {
+                    colors[i * 3] = data[headerEnd + 1 + offset + 12] / 255;
+                    colors[i * 3 + 1] = data[headerEnd + 1 + offset + 13] / 255;
+                    colors[i * 3 + 2] = data[headerEnd + 1 + offset + 14] / 255;
+                    offset += 15;
+                } else {
+                    offset += 12;
+                }
+            }
+            
+            createPointCloud(positions, colors, vertexCount);
+        }
+
+        function parseXYZ(text) {
+            const lines = text.split('\n').filter(line => line.trim());
+            const positions = [];
+            const colors = [];
+            
+            for (const line of lines) {
+                const parts = line.trim().split(/\s+/).map(parseFloat);
+                if (parts.length >= 3) {
+                    positions.push(parts[0], parts[1], parts[2]);
+                    if (parts.length >= 6) {
+                        colors.push(parts[3] / 255, parts[4] / 255, parts[5] / 255);
+                    }
+                }
+            }
+            
+            const posArray = new Float32Array(positions);
+            const colArray = colors.length > 0 ? new Float32Array(colors) : null;
+            createPointCloud(posArray, colArray, positions.length / 3);
+        }
+
+        function createPointCloud(positions, colors, count) {
+            if (pointCloud) {
+                scene.remove(pointCloud);
+            }
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            
+            if (colors) {
+                geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            }
+
+            const material = new THREE.PointsMaterial({
+                size: parseFloat(document.getElementById('pointSize').value),
+                vertexColors: colors ? true : false,
+                color: colors ? 0xffffff : 0x00aaff
+            });
+
+            pointCloud = new THREE.Points(geometry, material);
+            scene.add(pointCloud);
+
+            // Center camera on point cloud
+            geometry.computeBoundingSphere();
+            const center = geometry.boundingSphere.center;
+            const radius = geometry.boundingSphere.radius;
+            
+            camera.position.set(center.x + radius * 2, center.y + radius * 2, center.z + radius * 2);
+            camera.lookAt(center);
+
+            console.log(`Loaded ${count} points`);
+        }
+
+        function onMouseClick(event) {
+            if (!pointCloud) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(pointCloud);
+
+            if (intersects.length > 0) {
+                const point = intersects[0].point;
+                selectPoint(point);
+                console.log('Selected point:', point);
+            }
+        }
+
+        function selectPoint(point) {
+            selectedPoint = point;
+
+            // Remove old marker
+            if (selectionMarker) {
+                scene.remove(selectionMarker);
+            }
+
+            // Create marker
+            const geometry = new THREE.SphereGeometry(0.1, 16, 16);
+            const material = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+            selectionMarker = new THREE.Mesh(geometry, material);
+            selectionMarker.position.copy(point);
+            scene.add(selectionMarker);
+
+            // Update info
+            document.getElementById('info').innerHTML = `
+                Selected Point: (${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)})<br>
+                Left mouse: Rotate | Right mouse: Pan | Scroll: Zoom
+            `;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
