@@ -203,38 +203,95 @@
 
         function parsePLY(buffer) {
             const data = new Uint8Array(buffer);
-            const text = new TextDecoder().decode(data);
-            const headerEnd = text.indexOf('end_header') + 10;
+            const text = new TextDecoder().decode(data.slice(0, 5000));
+            
+            const headerEnd = text.indexOf('end_header') + 'end_header\n'.length;
             const header = text.substring(0, headerEnd);
             
             const vertexMatch = header.match(/element vertex (\d+)/);
             if (!vertexMatch) return;
             
             const vertexCount = parseInt(vertexMatch[1]);
-            const hasColor = header.includes('property uchar red');
+            const isBinary = header.includes('format binary');
+            const isAscii = header.includes('format ascii');
             
-            // Binary parsing
-            const dataView = new DataView(buffer, headerEnd + 1);
-            const positions = new Float32Array(vertexCount * 3);
-            const colors = hasColor ? new Float32Array(vertexCount * 3) : null;
+            // Parse property order
+            const properties = [];
+            const propLines = header.split('\n').filter(l => l.startsWith('property'));
+            propLines.forEach(line => {
+                const parts = line.split(/\s+/);
+                const type = parts[1];
+                const name = parts[2];
+                properties.push({ name, type });
+            });
             
-            let offset = 0;
-            for (let i = 0; i < vertexCount; i++) {
-                positions[i * 3] = dataView.getFloat32(offset, true);
-                positions[i * 3 + 1] = dataView.getFloat32(offset + 4, true);
-                positions[i * 3 + 2] = dataView.getFloat32(offset + 8, true);
+            console.log('Properties:', properties);
+            console.log('Vertex count:', vertexCount);
+            
+            if (isAscii) {
+                // ASCII format
+                const bodyText = new TextDecoder().decode(data.slice(headerEnd));
+                const lines = bodyText.split('\n').filter(l => l.trim());
+                const positions = [];
+                const colors = [];
                 
-                if (hasColor) {
-                    colors[i * 3] = data[headerEnd + 1 + offset + 12] / 255;
-                    colors[i * 3 + 1] = data[headerEnd + 1 + offset + 13] / 255;
-                    colors[i * 3 + 2] = data[headerEnd + 1 + offset + 14] / 255;
-                    offset += 15;
-                } else {
-                    offset += 12;
+                for (let i = 0; i < Math.min(lines.length, vertexCount); i++) {
+                    const parts = lines[i].trim().split(/\s+/).map(parseFloat);
+                    if (parts.length >= 3 && !isNaN(parts[0])) {
+                        positions.push(parts[0], parts[1], parts[2]);
+                        if (parts.length >= 6) {
+                            colors.push(parts[3] / 255, parts[4] / 255, parts[5] / 255);
+                        }
+                    }
                 }
+                
+                const posArray = new Float32Array(positions);
+                const colArray = colors.length > 0 ? new Float32Array(colors) : null;
+                createPointCloud(posArray, colArray, positions.length / 3);
+            } else if (isBinary) {
+                // Find binary start
+                let binaryStart = 0;
+                for (let i = 0; i < data.length - 11; i++) {
+                    if (data[i] === 101 && data[i+1] === 110 && data[i+2] === 100) { // "end"
+                        const chunk = new TextDecoder().decode(data.slice(i, i + 11));
+                        if (chunk === 'end_header\n') {
+                            binaryStart = i + 11;
+                            break;
+                        }
+                    }
+                }
+                
+                console.log('Binary start:', binaryStart);
+                
+                const dataView = new DataView(buffer, binaryStart);
+                const positions = new Float32Array(vertexCount * 3);
+                const colors = header.includes('red') ? new Float32Array(vertexCount * 3) : null;
+                
+                // Calculate stride
+                let stride = 0;
+                properties.forEach(p => {
+                    if (p.type === 'float') stride += 4;
+                    else if (p.type === 'uchar') stride += 1;
+                    else if (p.type === 'double') stride += 8;
+                });
+                
+                console.log('Stride:', stride);
+                
+                for (let i = 0; i < vertexCount; i++) {
+                    const offset = i * stride;
+                    positions[i * 3] = dataView.getFloat32(offset, true);
+                    positions[i * 3 + 1] = dataView.getFloat32(offset + 4, true);
+                    positions[i * 3 + 2] = dataView.getFloat32(offset + 8, true);
+                    
+                    if (colors && stride >= 15) {
+                        colors[i * 3] = dataView.getUint8(offset + 12) / 255;
+                        colors[i * 3 + 1] = dataView.getUint8(offset + 13) / 255;
+                        colors[i * 3 + 2] = dataView.getUint8(offset + 14) / 255;
+                    }
+                }
+                
+                createPointCloud(positions, colors, vertexCount);
             }
-            
-            createPointCloud(positions, colors, vertexCount);
         }
 
         function parseXYZ(text) {
@@ -280,13 +337,28 @@
 
             // Center camera on point cloud
             geometry.computeBoundingSphere();
-            const center = geometry.boundingSphere.center;
+            const center = geometry.boundingSphere.center.clone();
             const radius = geometry.boundingSphere.radius;
             
-            camera.position.set(center.x + radius * 2, center.y + radius * 2, center.z + radius * 2);
-            camera.lookAt(center);
+            // Move point cloud to origin
+            pointCloud.position.set(-center.x, -center.y, -center.z);
+            
+            // Position camera
+            const distance = radius * 2.5;
+            camera.position.set(distance, distance, distance);
+            camera.lookAt(0, 0, 0);
+            
+            // Update grid size based on point cloud
+            scene.children.forEach(child => {
+                if (child instanceof THREE.GridHelper) {
+                    scene.remove(child);
+                }
+            });
+            const gridSize = Math.max(20, radius * 3);
+            const gridHelper = new THREE.GridHelper(gridSize, 20);
+            scene.add(gridHelper);
 
-            console.log(`Loaded ${count} points`);
+            console.log(`Loaded ${count} points, center: (${center.x.toFixed(2)}, ${center.y.toFixed(2)}, ${center.z.toFixed(2)}), radius: ${radius.toFixed(2)}`);
         }
 
         function onMouseClick(event) {
